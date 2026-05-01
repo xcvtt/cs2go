@@ -13,7 +13,6 @@ import (
 )
 
 func getProcessHandle(pid int) (windows.Handle, error) {
-	// windows.PROCESS_VM_READ|windows.PROCESS_VM_WRITE|windows.PROCESS_VM_OPERATION
 	return windows.OpenProcess(windows.PROCESS_VM_READ, false, uint32(pid))
 }
 
@@ -104,4 +103,106 @@ func read(process windows.Handle, address uintptr, value interface{}) error {
 		}
 	}
 	return nil
+}
+
+func findPattern(handle windows.Handle, moduleBase uintptr, pattern string) (uintptr, error) {
+	moduleSize, err := getModuleSize(handle, moduleBase)
+	if err != nil {
+		return 0, err
+	}
+
+	buffer := make([]byte, moduleSize)
+	var bytesRead uintptr
+	err = windows.ReadProcessMemory(handle, moduleBase, &buffer[0], moduleSize, &bytesRead)
+	if err != nil {
+		return 0, err
+	}
+
+	patternBytes, mask := parsePattern(pattern)
+
+	for i := 0; i < len(buffer)-len(patternBytes); i++ {
+		found := true
+		for j := 0; j < len(patternBytes); j++ {
+			if mask[j] && buffer[i+j] != patternBytes[j] {
+				found = false
+				break
+			}
+		}
+		if found {
+			address := moduleBase + uintptr(i)
+			return resolveRIP(buffer[i:], address), nil
+		}
+	}
+
+	return 0, fmt.Errorf("pattern not found")
+}
+
+func parsePattern(pattern string) ([]byte, []bool) {
+	parts := strings.Split(strings.TrimSpace(pattern), " ")
+	patternBytes := make([]byte, len(parts))
+	mask := make([]bool, len(parts))
+
+	for i, part := range parts {
+		if part == "??" {
+			mask[i] = false
+		} else {
+			var b byte
+			fmt.Sscanf(part, "%02X", &b)
+			patternBytes[i] = b
+			mask[i] = true
+		}
+	}
+
+	return patternBytes, mask
+}
+
+func resolveRIP(buffer []byte, address uintptr) uintptr {
+	var ripOffset int32
+	var instructionLen int
+
+	if len(buffer) >= 7 && buffer[0] == 0x48 && buffer[1] == 0x8D && buffer[2] == 0x0D {
+		// LEA rcx, [rip+offset] - 48 8D 0D [4 bytes]
+		ripOffset = int32(binary.LittleEndian.Uint32(buffer[3:7]))
+		instructionLen = 7
+	} else if len(buffer) >= 7 && buffer[0] == 0x48 && buffer[1] == 0x8D && buffer[2] == 0x05 {
+		// LEA rax, [rip+offset] - 48 8D 05 [4 bytes]
+		ripOffset = int32(binary.LittleEndian.Uint32(buffer[3:7]))
+		instructionLen = 7
+	} else if len(buffer) >= 7 && buffer[0] == 0x48 && buffer[1] == 0x89 && buffer[2] == 0x0D {
+		// MOV [rip+offset], rcx - 48 89 0D [4 bytes]
+		ripOffset = int32(binary.LittleEndian.Uint32(buffer[3:7]))
+		instructionLen = 7
+	} else if len(buffer) >= 7 && buffer[0] == 0x48 && buffer[1] == 0x8B && buffer[2] == 0x05 {
+		// MOV rax, [rip+offset] - 48 8B 05 [4 bytes]
+		ripOffset = int32(binary.LittleEndian.Uint32(buffer[3:7]))
+		instructionLen = 7
+	} else {
+		// Default: assume RIP offset at position 3
+		ripOffset = int32(binary.LittleEndian.Uint32(buffer[3:7]))
+		instructionLen = 7
+	}
+
+	// Calculate: instruction address + instruction length + RIP offset
+	return address + uintptr(instructionLen) + uintptr(ripOffset)
+}
+
+func getModuleSize(handle windows.Handle, moduleBase uintptr) (uintptr, error) {
+	var dosHeader [64]byte
+	var bytesRead uintptr
+	err := windows.ReadProcessMemory(handle, moduleBase, &dosHeader[0], 64, &bytesRead)
+	if err != nil {
+		return 0, err
+	}
+
+	e_lfanew := binary.LittleEndian.Uint32(dosHeader[60:64])
+
+	var ntHeaders [256]byte
+	err = windows.ReadProcessMemory(handle, moduleBase+uintptr(e_lfanew), &ntHeaders[0], 256, &bytesRead)
+	if err != nil {
+		return 0, err
+	}
+
+	sizeOfImage := binary.LittleEndian.Uint32(ntHeaders[80:84])
+
+	return uintptr(sizeOfImage), nil
 }

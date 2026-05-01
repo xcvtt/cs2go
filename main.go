@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -98,20 +99,18 @@ var (
 	nameRendering       bool   = true
 	healthBarRendering  bool   = true
 	healthTextRendering bool   = true
-	frameDelay          uint32 = 1 // default 1ms = ~1000fps cap
+	frameDelay          uint32 = 5
 )
 
-// Cached screen dimensions — set once, never call GetSystemMetrics per frame
 var (
 	cachedScreenWidth  float32
 	cachedScreenHeight float32
 )
 
-// Per-frame scratch buffers — pre-allocated, reused every frame, zero heap pressure
 var (
-	hpTextBuf [8]byte     // "100\0" etc
-	utf16Buf  [256]uint16 // reusable UTF-16 scratch
-	nameUtf16 [64]uint16  // name conversion scratch
+	hpTextBuf [8]byte
+	utf16Buf  [256]uint16
+	nameUtf16 [64]uint16
 )
 
 func init() {
@@ -123,7 +122,6 @@ func logAndSleep(message string, err error) {
 	time.Sleep(5 * time.Second)
 }
 
-// worldToScreen uses cached screen dimensions — no syscall per call
 func worldToScreen(viewMatrix Matrix, position Vector3) (float32, float32) {
 	screenX := viewMatrix[0][0]*position.X + viewMatrix[0][1]*position.Y + viewMatrix[0][2]*position.Z + viewMatrix[0][3]
 	screenY := viewMatrix[1][0]*position.X + viewMatrix[1][1]*position.Y + viewMatrix[1][2]*position.Z + viewMatrix[1][3]
@@ -141,26 +139,236 @@ func worldToScreen(viewMatrix Matrix, position Vector3) (float32, float32) {
 	return x, y
 }
 
-func getOffsets() Offset {
-	var offsets Offset
-	offsetsJson, err := os.Open("offsets.json")
-	if err != nil {
-		fmt.Println("Error opening offsets.json", err)
-		return offsets
+type TestResult int
+
+const (
+	TestOK TestResult = iota
+	TestOffsetsWrong
+	TestNoPlayers
+)
+
+func (r TestResult) String() string {
+	switch r {
+	case TestOK:
+		return "OK"
+	case TestOffsetsWrong:
+		return "OFFSETS_WRONG"
+	case TestNoPlayers:
+		return "NO_PLAYERS"
+	default:
+		return "UNKNOWN"
 	}
-	defer offsetsJson.Close()
-	err = json.NewDecoder(offsetsJson).Decode(&offsets)
-	if err != nil {
-		fmt.Println("Error decoding JSON:", err)
-		return offsets
-	}
-	return offsets
 }
 
-// entityPool avoids re-allocating the entity slice every frame
+func getOffsets(handle windows.Handle, clientBase uintptr) (Offset, error) {
+	var offsets Offset
+
+	offsetsJson, err := os.Open("offsets.json")
+	if err != nil {
+		return offsets, fmt.Errorf("offsets.json not found - please provide valid offsets: %w", err)
+	}
+	defer offsetsJson.Close()
+
+	err = json.NewDecoder(offsetsJson).Decode(&offsets)
+	if err != nil {
+		return offsets, fmt.Errorf("error decoding offsets.json: %w", err)
+	}
+
+	fmt.Println("[*] Loaded offsets from offsets.json")
+
+	if offsets.M_hPlayerPawn == 0 || offsets.M_iHealth == 0 || offsets.M_iTeamNum == 0 {
+		return offsets, fmt.Errorf("missing required member offsets in offsets.json")
+	}
+
+	result := functionalTest(handle, clientBase, offsets)
+	fmt.Printf("[*] Functional test result: %s\n", result)
+
+	if result == TestOK {
+		fmt.Println("[+] Offsets are valid!")
+		return offsets, nil
+	}
+
+	fmt.Println("[!] Base offsets validation failed, scanning for new offsets...")
+
+	dwViewMatrix, err := findPattern(handle, clientBase, "48 8D 0D ?? ?? ?? ?? 48 C1 E0 06")
+	if err != nil {
+		return offsets, fmt.Errorf("failed to find dwViewMatrix pattern: %w", err)
+	}
+	offsets.DwViewMatrix = dwViewMatrix - clientBase
+	fmt.Printf("[+] dwViewMatrix: 0x%X\n", offsets.DwViewMatrix)
+
+	dwLocalPlayerPawn, err := findLocalPlayerPawn(handle, clientBase)
+	if err != nil {
+		return offsets, fmt.Errorf("failed to find dwLocalPlayerPawn: %w", err)
+	}
+	offsets.DwLocalPlayerPawn = dwLocalPlayerPawn
+	fmt.Printf("[+] dwLocalPlayerPawn: 0x%X\n", offsets.DwLocalPlayerPawn)
+
+	dwEntityList, err := findPattern(handle, clientBase, "48 89 0D ?? ?? ?? ?? E9 ?? ?? ?? ?? CC")
+	if err != nil {
+		return offsets, fmt.Errorf("failed to find dwEntityList pattern: %w", err)
+	}
+	offsets.DwEntityList = dwEntityList - clientBase
+	fmt.Printf("[+] dwEntityList: 0x%X\n", offsets.DwEntityList)
+
+	result = functionalTest(handle, clientBase, offsets)
+	fmt.Printf("[*] Functional test after scan: %s\n", result)
+
+	if result == TestOffsetsWrong {
+		return offsets, fmt.Errorf("scanned offsets failed validation - member offsets may be outdated")
+	}
+
+	err = saveOffsetsToJSON(offsets)
+	if err != nil {
+		fmt.Println("[!] Warning: Could not save offsets to JSON:", err)
+	} else {
+		fmt.Println("[+] Saved updated offsets to offsets.json")
+	}
+
+	return offsets, nil
+}
+
+func findLocalPlayerPawn(handle windows.Handle, moduleBase uintptr) (uintptr, error) {
+	dwPrediction, err := findPattern(handle, moduleBase, "48 8D 05 ?? ?? ?? ?? C3 CC CC CC CC CC CC CC CC 40 53 56 41 54")
+	if err != nil {
+		return 0, fmt.Errorf("dwPrediction pattern not found: %w", err)
+	}
+
+	fmt.Printf("[*] dwPrediction found at: 0x%X\n", dwPrediction-moduleBase)
+
+	moduleSize, err := getModuleSize(handle, moduleBase)
+	if err != nil {
+		return 0, err
+	}
+
+	buffer := make([]byte, moduleSize)
+	var bytesRead uintptr
+	err = windows.ReadProcessMemory(handle, moduleBase, &buffer[0], moduleSize, &bytesRead)
+	if err != nil {
+		return 0, err
+	}
+
+	pattern := "4C 39 B6 ?? ?? ?? ?? 74 ?? 44 88 BE"
+	patternBytes, mask := parsePattern(pattern)
+
+	for i := 0; i < len(buffer)-len(patternBytes); i++ {
+		found := true
+		for j := 0; j < len(patternBytes); j++ {
+			if mask[j] && buffer[i+j] != patternBytes[j] {
+				found = false
+				break
+			}
+		}
+		if found {
+			offsetValue := binary.LittleEndian.Uint32(buffer[i+3 : i+7])
+
+			result := dwPrediction + uintptr(offsetValue)
+
+			fmt.Printf("[*] Found pattern at module+0x%X, offset value: 0x%X\n", i, offsetValue)
+			fmt.Printf("[*] dwLocalPlayerPawn = dwPrediction(0x%X) + offset(0x%X) = 0x%X\n",
+				dwPrediction-moduleBase, offsetValue, result-moduleBase)
+
+			return result - moduleBase, nil
+		}
+	}
+
+	return 0, fmt.Errorf("dwLocalPlayerPawn offset pattern not found")
+}
+
+func functionalTest(handle windows.Handle, clientBase uintptr, offsets Offset) TestResult {
+	if clientBase == 0 {
+		fmt.Println("[!] client_base is 0")
+		return TestOffsetsWrong
+	}
+
+	var entityList uintptr
+	err := read(handle, clientBase+offsets.DwEntityList, &entityList)
+	if err != nil || entityList == 0 {
+		fmt.Printf("[!] entity_list is null (offset 0x%X)\n", offsets.DwEntityList)
+		return TestOffsetsWrong
+	}
+
+	var firstPage uintptr
+	err = read(handle, entityList+16, &firstPage)
+	if err != nil || firstPage == 0 {
+		return TestNoPlayers
+	}
+
+	validPlayers := 0
+	bogusReads := 0
+
+	for i := 1; i < 64; i++ {
+		var controller uintptr
+		err := read(handle, firstPage+112*uintptr(i&0x1FF), &controller)
+		if err != nil || controller == 0 {
+			continue
+		}
+
+		var pawnHandle uint32
+		err = read(handle, controller+offsets.M_hPlayerPawn, &pawnHandle)
+		if err != nil || pawnHandle == 0 {
+			continue
+		}
+
+		var pawnPage uintptr
+		err = read(handle, entityList+8*uintptr((pawnHandle&0x7FFF)>>9)+16, &pawnPage)
+		if err != nil || pawnPage == 0 {
+			continue
+		}
+
+		var pawn uintptr
+		err = read(handle, pawnPage+112*uintptr(pawnHandle&0x1FF), &pawn)
+		if err != nil || pawn == 0 {
+			continue
+		}
+
+		var team int32
+		var health int32
+		err1 := read(handle, pawn+offsets.M_iTeamNum, &team)
+		err2 := read(handle, pawn+offsets.M_iHealth, &health)
+
+		if err1 != nil || err2 != nil {
+			continue
+		}
+
+		if team >= 0 && team <= 3 {
+			if health >= 0 && health <= 100 {
+				validPlayers++
+			} else if health > 100 || health < -1 {
+				bogusReads++
+			}
+		} else {
+			bogusReads++
+		}
+	}
+
+	if validPlayers > 0 && bogusReads <= validPlayers {
+		fmt.Printf("[+] Found %d valid players in functional test\n", validPlayers)
+		return TestOK
+	}
+
+	if validPlayers == 0 && bogusReads == 0 {
+		return TestNoPlayers
+	}
+
+	fmt.Printf("[!] Functional test failed: %d valid, %d bogus reads\n", validPlayers, bogusReads)
+	return TestOffsetsWrong
+}
+
+func saveOffsetsToJSON(offsets Offset) error {
+	file, err := os.Create("offsets.json")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "    ")
+	return encoder.Encode(offsets)
+}
+
 var entityPool [64]Entity
 
-// bonePool: pre-allocated bone maps per entity slot — no map allocs per frame
 var bonePool [64]map[string]Vector2
 
 func initBonePools() {
@@ -180,7 +388,7 @@ func initBonePools() {
 }
 
 func getEntitiesInfo(procHandle windows.Handle, clientDll uintptr, offsets Offset) []Entity {
-	entities := entityPool[:0] // reuse backing array, zero length
+	entities := entityPool[:0]
 	var entityList uintptr
 	err := read(procHandle, clientDll+offsets.DwEntityList, &entityList)
 	if err != nil {
@@ -269,7 +477,6 @@ func getEntitiesInfo(procHandle windows.Handle, clientDll uintptr, offsets Offse
 			continue
 		}
 
-		// Name: read into reusable scratch, no strings.Builder alloc
 		var entityName string
 		if err = read(procHandle, entityController+offsets.M_sSanitizedPlayerName, &entityNameAddress); err != nil {
 			continue
@@ -277,8 +484,7 @@ func getEntitiesInfo(procHandle windows.Handle, clientDll uintptr, offsets Offse
 		if err = read(procHandle, entityNameAddress, &entityName); err != nil || entityName == "" {
 			continue
 		}
-		// Sanitize in-place using a fixed scratch Builder backed by pool slot
-		// We use the pool entity's Name field as scratch (it's already allocated from last frame)
+
 		var sb strings.Builder
 		sb.Grow(len(entityName))
 		for _, c := range entityName {
@@ -297,7 +503,6 @@ func getEntitiesInfo(procHandle windows.Handle, clientDll uintptr, offsets Offse
 			continue
 		}
 
-		// Reuse bone map from pool — no alloc
 		entityBones := bonePool[entityCount]
 
 		for boneName, boneIndex := range bones {
@@ -373,7 +578,6 @@ func drawSkeleton(hdc win.HDC, pen uintptr, bones map[string]Vector2) {
 	win.LineTo(hdc, int32(bones["hand_R"].X), int32(bones["hand_R"].Y))
 }
 
-// intToUtf16Scratch converts int32 to UTF-16 in a fixed buffer, returns slice — zero alloc
 func intToUtf16Scratch(n int32, buf []uint16) ([]uint16, int32) {
 	s := strconv.AppendInt(hpTextBuf[:0], int64(n), 10)
 	l := len(s)
@@ -384,7 +588,6 @@ func intToUtf16Scratch(n int32, buf []uint16) ([]uint16, int32) {
 	return buf[:l], int32(l)
 }
 
-// stringToUtf16Scratch converts string to UTF-16 in a fixed buffer, returns length — zero alloc
 func stringToUtf16Scratch(s string, buf []uint16) int32 {
 	i := 0
 	for _, r := range s {
@@ -444,7 +647,6 @@ func renderEntityInfo(hdc win.HDC, tPen uintptr, gPen uintptr, oPen uintptr, hPe
 	}
 
 	if healthTextRendering {
-		// Zero-alloc: convert int to UTF-16 in scratch buffer
 		_, hpLen := intToUtf16Scratch(hp, utf16Buf[:])
 		win.SetTextColor(hdc, win.RGB(0, 255, 50))
 		setTextAlign.Call(uintptr(hdc), 0x00000002)
@@ -583,7 +785,6 @@ func main() {
 	debug.SetGCPercent(-1)
 	runtime.LockOSThread()
 
-	// Set Windows timer resolution to 1ms — critical for sub-16ms frame pacing
 	timeBeginPeriod.Call(1)
 	defer timeEndPeriod.Call(1)
 
@@ -593,15 +794,6 @@ func main() {
 	cachedScreenHeight = float32(sh)
 
 	initBonePools()
-
-	go cliMenu()
-
-	hwnd := initWindow(uintptr(cachedScreenWidth), uintptr(cachedScreenHeight))
-	if hwnd == 0 {
-		logAndSleep("Error creating window", fmt.Errorf("%v", win.GetLastError()))
-		return
-	}
-	defer win.DestroyWindow(hwnd)
 
 	pid, err := findProcessId("cs2.exe")
 	if err != nil {
@@ -618,6 +810,20 @@ func main() {
 		logAndSleep("Error getting process handle", err)
 		return
 	}
+	offsets, err := getOffsets(procHandle, clientDll)
+	if err != nil {
+		logAndSleep("Error loading offsets", err)
+		return
+	}
+
+	go cliMenu()
+
+	hwnd := initWindow(uintptr(cachedScreenWidth), uintptr(cachedScreenHeight))
+	if hwnd == 0 {
+		logAndSleep("Error creating window", fmt.Errorf("%v", win.GetLastError()))
+		return
+	}
+	defer win.DestroyWindow(hwnd)
 
 	hdc := win.GetDC(hwnd)
 	if hdc == 0 {
@@ -640,13 +846,10 @@ func main() {
 	defer win.DeleteObject(win.HGDIOBJ(bonePen))
 	defer win.DeleteObject(win.HGDIOBJ(outlinePen))
 
-	offsets := getOffsets()
-
-	// ── Persistent back-buffer: allocated ONCE, reused every frame ──────────
 	memhdc, _, _ := createCompatibleDC.Call(uintptr(hdc))
 	memBitmap := win.CreateCompatibleBitmap(hdc, int32(cachedScreenWidth), int32(cachedScreenHeight))
 	win.SelectObject(win.HDC(memhdc), win.HGDIOBJ(memBitmap))
-	// NULL_BRUSH (stock object 5) = hollow fill for Ellipse/Rectangle etc.
+
 	nullBrush, _, _ := getStockObject.Call(5)
 	win.SelectObject(win.HDC(memhdc), win.HGDIOBJ(nullBrush))
 	win.SetBkMode(win.HDC(memhdc), win.TRANSPARENT)
@@ -657,9 +860,7 @@ func main() {
 	var msg win.MSG
 	var frameStart time.Time
 
-	// ── PeekMessage loop: never blocks, runs as fast as possible ────────────
 	for {
-		// Drain all pending Windows messages without blocking
 		for peekMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 1 /*PM_REMOVE*/); msg.Message != win.WM_QUIT; {
 			win.TranslateMessage(&msg)
 			win.DispatchMessage(&msg)
@@ -674,7 +875,6 @@ func main() {
 
 		frameStart = time.Now()
 
-		// Clear back-buffer — PatBlt BLACKNESS (0x00000042)
 		patBlt.Call(memhdc, 0, 0, uintptr(cachedScreenWidth), uintptr(cachedScreenHeight), 0x00000042)
 
 		entities := getEntitiesInfo(procHandle, clientDll, offsets)
@@ -692,10 +892,8 @@ func main() {
 			}
 		}
 
-		// Blit back-buffer to screen
 		win.BitBlt(hdc, 0, 0, int32(cachedScreenWidth), int32(cachedScreenHeight), win.HDC(memhdc), 0, 0, win.SRCCOPY)
 
-		// Frame pacing: sleep only the remaining budget (1ms minimum resolution)
 		if frameDelay > 0 {
 			elapsed := time.Since(frameStart)
 			budget := time.Duration(frameDelay) * time.Millisecond
