@@ -105,20 +105,3 @@ func read(process windows.Handle, address uintptr, value interface{}) error {
 	}
 	return nil
 }
-
-// func write(process windows.Handle, address uintptr, value interface{}) error {
-// 	var buffer bytes.Buffer
-// 	err := binary.Write(&buffer, binary.LittleEndian, value)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	bytesWritten := uintptr(0)
-// 	err = windows.WriteProcessMemory(process, address, &buffer.Bytes()[0], uintptr(buffer.Len()), &bytesWritten)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	if bytesWritten != uintptr(buffer.Len()) {
-// 		return fmt.Errorf("wrote %d bytes, expected %d", bytesWritten, buffer.Len())
-// 	}
-// 	return nil
-// }

@@ -1,5 +1,3 @@
-<h1 style="color:red;">-----This program is depricated-----</h1>
-
 # cs2go
 
 cs2go is a simple external ESP for Counter-Strike 2, written in Go.
